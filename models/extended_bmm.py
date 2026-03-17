@@ -2,12 +2,6 @@
 Blood Glucose Prediction using Extended Bergman Model
 LODO Cross-Validation with Internal 5-Fold Processing (No Data Leakage)
 
-改进版LODO：
-- 每个LODO fold的训练集内部再分5折
-- Fold 1: 参数优化
-- Fold 2-4: 异常检测
-- Fold 5: 内部验证
-- 完全避免数据泄露
 """
 
 import numpy as np
