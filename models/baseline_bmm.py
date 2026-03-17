@@ -1,295 +1,498 @@
+"""
+Baseline: Basic Bergman Minimal Model (without GI and Circadian Factors)
 
-import argparse
-from pathlib import Path
+This is the original Bergman Minimal Model (1979) for comparison with the extended model.
+No GI effects, no circadian rhythms, simple meal disturbance.
+"""
+
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
+import os
+from datetime import timedelta
 from scipy.integrate import odeint
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from bayes_opt import BayesianOptimization
+import warnings
+warnings.filterwarnings('ignore')
 
-"""
-Paper-aligned example-output generator for Scenario 4.
-
-Protocol:
-- Outer split: leave-one-day-out (LODO)
-- Internal split: first four folds (80%) for parameter selection
-- Fifth fold (20%) for internal validation
-- Same protocol is applied to both the baseline BMM and the extended BMM
-
-Note:
-This script is intended to generate repository example outputs efficiently.
-It follows the paper-aligned split logic, but uses a lightweight candidate-search
-procedure instead of the full internal optimisation workflow used in the complete
-research codebase.
-"""
-
-Gb, Ib, n, V1, P2 = 81, 18, 5 / 54, 12, 0.0287
-
-BASELINE_CANDIDATES = [
-    [0.022, 9.5e-5, 0.37, 0.30, 18, 1.47],
-    [0.050, 1.0e-4, 0.50, 0.50, 34, 1.00],
-    [0.031, 1.0e-4, 0.31, 0.50, 14, 1.96],
-]
-
-EXTENDED_CANDIDATES = [
-    [0.031, 9.8e-5, 0.34, 0.37, 18, 2.42],
-    [0.050, 1.0e-6, 0.50, 0.50, 56, 2.00],
-    [0.021, 5.5e-5, 0.23, 0.41, 18, 2.77],
-]
-
-
-def load_data(file_path: str) -> pd.DataFrame:
+############################################
+# 1. Data Loading and Preprocessing
+############################################
+def load_and_preprocess(file_path):
+    """Load data, remove missing 'Libre GL' values"""
     df = pd.read_csv(file_path)
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
-    df = df.dropna(subset=["Timestamp", "Libre GL"]).fillna(0)
-    df = df.sort_values("Timestamp").reset_index(drop=True)
-    df["Date"] = df["Timestamp"].dt.date
-    df["Libre GL"] = df["Libre GL"].clip(40, 400)
+    df = df.dropna(subset=['Libre GL']).fillna(0)
+    df['Timestamp'] = pd.to_datetime(df['Timestamp'], format='%m/%d/%Y %H:%M')
+    df.sort_values('Timestamp', inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    df['Date'] = df['Timestamp'].dt.date
     return df
 
+def preprocess_data(df):
+    """Basic preprocessing"""
+    df = df.copy()
+    df = df.sort_values('Timestamp')
+    df.reset_index(drop=True, inplace=True)
+    df['Libre GL'] = df['Libre GL'].clip(40, 400)
+    return df
 
-def split_train_into_5folds(train_data: pd.DataFrame):
-    sorted_dates = sorted(train_data["Date"].unique())
+############################################
+# 2. Model Constants
+############################################
+Gb, Ib, n, V1, P2 = 81, 18, 5/54, 12, 0.0287
+
+############################################
+# 3. BASIC Bergman Minimal Model (NO GI, NO Circadian)
+############################################
+def disturb_meals_basic(t_val, meal_data, beta_meal, gamma_meal, t_lag, peak_mult, time_origin):
+    """
+    BASIC meal disturbance - NO GI effects, NO meal type effects
+    Simple proportional to carbohydrate content only
+    """
+    D_total = 0
+    for idx in range(len(meal_data)):
+        row = meal_data.iloc[idx]
+        meal_t = (row['Timestamp'] - time_origin).total_seconds() / 60.0
+        
+        if t_val >= meal_t + t_lag:
+            dt = t_val - meal_t - t_lag
+            
+            # BASIC: Only carbohydrate content, NO GI multiplier, NO meal type factor
+            FG = row['Carbs']  # Simple: just carbs, no GI effect
+            
+            # Simple dual-exponential absorption
+            D_total += FG * peak_mult * (1 - np.exp(-beta_meal * dt)) * np.exp(-gamma_meal * dt)
+    
+    return D_total
+
+def bergman_ode_basic(y, t_val, p1, p3, beta_meal, gamma_meal, t_lag, peak_mult, 
+                      time_origin, meal_data):
+    """
+    BASIC Bergman Minimal Model - Original 3-equation system
+    NO circadian factor, NO GI effects
+    """
+    G, I, X = y  # Only 3 states (no E)
+    
+    # BASIC meal disturbance (no GI, no meal type)
+    D = disturb_meals_basic(t_val, meal_data, beta_meal, gamma_meal, t_lag, peak_mult, time_origin)
+    
+    # NO CIRCADIAN FACTOR - just constant dynamics
+    dGdt = -p1 * G - X * (G + Gb) + D
+    dIdt = -n * (I + Ib) + n * V1 * (Ib - P2 * p1 * 15 / p3 / (15 + Gb)) / V1
+    dXdt = -P2 * X + p3 * I
+    
+    return [dGdt, dIdt, dXdt]
+
+def solve_bergman_basic(p1, p3, beta_meal, gamma_meal, t_lag, peak_mult, 
+                        time_origin, meal_data, y0, t_span):
+    """Solve BASIC Bergman ODE system"""
+    def ode_func(y, t_val):
+        return bergman_ode_basic(y, t_val, p1, p3, beta_meal, gamma_meal, 
+                                 t_lag, peak_mult, time_origin, meal_data)
+    
+    soln = odeint(ode_func, y0, t_span)
+    G_pred = soln[:, 0] + Gb
+    return G_pred
+
+############################################
+# 4. LODO Cross-Validation
+############################################
+def lodo_cv_split(data):
+    """Leave-One-Day-Out splits"""
+    sorted_dates = sorted(data['Date'].unique())
+    splits = []
+    for test_date in sorted_dates:
+        train_dates = [d for d in sorted_dates if d != test_date]
+        splits.append((train_dates, [test_date]))
+    return splits
+
+def split_train_into_5folds(train_data):
+    """Split training into 5 folds"""
+    sorted_dates = sorted(train_data['Date'].unique())
     n_days = len(sorted_dates)
-
+    
     if n_days < 5:
         folds = []
-        for i in range(5):
-            dates = sorted_dates[i:i + 1] if i < n_days else []
-            folds.append(train_data[train_data["Date"].isin(dates)].copy())
+        for i in range(min(n_days, 5)):
+            if i < n_days:
+                fold_dates = [sorted_dates[i]]
+                fold_data = train_data[train_data['Date'].isin(fold_dates)].copy()
+                folds.append(fold_data)
+            else:
+                folds.append(pd.DataFrame())
         return folds
-
+    
     fold_size = n_days // 5
     folds = []
     for i in range(5):
-        start = i * fold_size
-        dates = sorted_dates[start:] if i == 4 else sorted_dates[start:start + fold_size]
-        folds.append(train_data[train_data["Date"].isin(dates)].copy())
+        start_idx = i * fold_size
+        if i == 4:
+            fold_dates = sorted_dates[start_idx:]
+        else:
+            end_idx = start_idx + fold_size
+            fold_dates = sorted_dates[start_idx:end_idx]
+        
+        fold_data = train_data[train_data['Date'].isin(fold_dates)].copy()
+        folds.append(fold_data)
+    
     return folds
 
+############################################
+# 5. Parameter Optimization
+############################################
+def optimize_parameters_basic(train_data, pbounds, init_points=5, n_iter=15):
+    """Optimize BASIC model parameters"""
+    train_data = train_data.copy()
+    train_data.reset_index(drop=True, inplace=True)
+    
+    if len(train_data) < 10:
+        return None
+    
+    time_origin = train_data['Timestamp'].iloc[0]
+    train_meals = train_data[
+        (train_data['Carbs'] > 0)  # Only need carbs, no GI
+    ][['Timestamp', 'Carbs']].copy()
+    
+    train_data['t_min'] = (train_data['Timestamp'] - time_origin).dt.total_seconds() / 60
+    t_max = train_data['t_min'].max()
+    t_span = np.linspace(0, t_max, int(t_max) + 1)
+    
+    G0 = train_data['Libre GL'].iloc[0]
+    y0 = [max(30, G0 - Gb), 0, 0]  # Only 3 states
+    
+    def objective(p1, p3, beta_meal, gamma_meal, t_lag, peak_mult):
+        try:
+            G_pred = solve_bergman_basic(
+                p1, p3, beta_meal, gamma_meal, t_lag, peak_mult,
+                time_origin, train_meals, y0, t_span
+            )
+            
+            G_pred_interp = np.interp(train_data['t_min'].values, t_span, G_pred)
+            rmse = np.sqrt(mean_squared_error(train_data['Libre GL'].values, G_pred_interp))
+            
+            return -rmse
+        except:
+            return -1000
+    
+    optimizer = BayesianOptimization(
+        f=objective,
+        pbounds=pbounds,
+        random_state=42,
+        verbose=0
+    )
+    
+    optimizer.maximize(init_points=init_points, n_iter=n_iter)
+    
+    return optimizer.max['params']
 
-def prepare_day(day_data: pd.DataFrame, extended: bool = False, obs_step: int = 15):
-    day_data = day_data.sort_values("Timestamp").reset_index(drop=True)
-    start_time = day_data["Timestamp"].iloc[0]
+############################################
+# 6. Last-Step Prediction
+############################################
+def predict_last_step_basic(data, params, PH_values):
+    """Last-step prediction with BASIC model"""
+    data = data.copy()
+    data.reset_index(drop=True, inplace=True)
+    
+    predictions_dict = {PH: [] for PH in PH_values}
+    
+    if len(data) < 2:
+        return predictions_dict
+    
+    time_origin = data['Timestamp'].iloc[0]
+    G0 = data['Libre GL'].iloc[0]
+    y_current = [max(30, G0 - Gb), 0, 0]  # 3 states
+    
+    max_PH = max(PH_values)
+    pos = 0
+    max_pos = len(data) - 1
+    
+    while pos < max_pos:
+        try:
+            current_time = data.loc[pos, 'Timestamp']
+            current_glucose = data.loc[pos, 'Libre GL']
+            
+            # Extract historical meals (only need carbs)
+            historical_meals = data[
+                (data['Timestamp'] <= current_time) & 
+                (data['Carbs'] > 0)
+            ][['Timestamp', 'Carbs']].copy()
+            
+            t_span = np.linspace(0, max_PH, int(max_PH) + 1)
+            
+            try:
+                G_pred_series = solve_bergman_basic(
+                    params['p1'], params['p3'], 
+                    params['beta_meal'], params['gamma_meal'],
+                    params['t_lag'], params['peak_mult'],
+                    current_time, historical_meals, y_current, t_span
+                )
+            except:
+                pos += 1
+                continue
+            
+            for PH in PH_values:
+                target_time = current_time + timedelta(minutes=PH)
+                future_data = data[data['Timestamp'] >= target_time]
+                
+                if future_data.empty:
+                    continue
+                
+                target_pos = future_data.index[0]
+                if target_pos >= len(data):
+                    continue
+                
+                actual_time = data.loc[target_pos, 'Timestamp']
+                actual_glucose = data.loc[target_pos, 'Libre GL']
+                
+                if int(PH) < len(G_pred_series):
+                    y_pred = G_pred_series[int(PH)]
+                else:
+                    y_pred = G_pred_series[-1]
+                
+                predictions_dict[PH].append({
+                    'current_time': current_time,
+                    'target_time': actual_time,
+                    'y_true': actual_glucose,
+                    'y_pred': y_pred,
+                    'current_glucose': current_glucose,
+                    'PH': PH
+                })
+            
+            y_current[0] = current_glucose - Gb
+            skip_interval = max(1, int(min(PH_values) / 3))
+            pos += skip_interval
+            
+        except Exception as e:
+            pos += 1
+    
+    return predictions_dict
 
-    obs = day_data.iloc[::obs_step].copy().reset_index(drop=True)
-    obs_t = ((obs["Timestamp"] - start_time).dt.total_seconds() / 60.0).to_numpy(dtype=float)
-    obs_g = obs["Libre GL"].to_numpy(dtype=float)
-
-    if extended:
-        meals = day_data[(day_data["Carbs"] > 0) & (day_data["GI"] > 0)][["Timestamp", "Meal Type", "GI", "Carbs"]].copy()
-    else:
-        meals = day_data[(day_data["Carbs"] > 0)][["Timestamp", "Meal Type", "GI", "Carbs"]].copy()
-
-    meal_t = ((meals["Timestamp"] - start_time).dt.total_seconds() / 60.0).to_numpy(dtype=float)
-    carbs = meals["Carbs"].to_numpy(dtype=float) if len(meals) else np.array([], dtype=float)
-    gi = meals["GI"].to_numpy(dtype=float) if len(meals) else np.array([], dtype=float)
-    meal_types = meals["Meal Type"].astype(str).str.lower().tolist() if len(meals) else []
-
-    if extended and len(meals):
-        gi_mult = np.where(
-            gi > 70, 1.2 + (gi - 70) * 0.005,
-            np.where(gi < 30, 0.8 - (30 - gi) * 0.005, 1.0 + (gi - 50) * 0.004)
-        )
-        type_mult = np.array([1.2 if "breakfast" in x else 0.9 if "dinner" in x else 1.0 for x in meal_types], dtype=float)
-        fg_base = carbs * (gi / 100.0) * gi_mult * type_mult
-    else:
-        fg_base = carbs
-
+############################################
+# 7. Evaluation
+############################################
+def evaluate_predictions(predictions_list):
+    """Calculate metrics"""
+    if not predictions_list:
+        return None
+    
+    y_true = np.array([p['y_true'] for p in predictions_list])
+    y_pred = np.array([p['y_pred'] for p in predictions_list])
+    y_pred = np.clip(y_pred, 40, 400)
+    
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    time_in_range = np.mean((y_pred >= 70) & (y_pred <= 180)) * 100
+    
     return {
-        "obs_t": obs_t,
-        "obs_g": obs_g,
-        "meal_t": meal_t,
-        "fg_base": fg_base,
-        "extended": extended,
+        'RMSE': rmse,
+        'MAE': mae,
+        'MAPE': mape,
+        'Time_in_Range': time_in_range,
+        'N_Predictions': len(predictions_list)
     }
 
-
-def meal_disturbance(t, meal_t, fg_base, beta, gamma, t_lag, peak_mult):
-    if len(meal_t) == 0:
-        return 0.0
-    dt = t - meal_t - t_lag
-    mask = dt >= 0
-    if not mask.any():
-        return 0.0
-    d = dt[mask]
-    fg = fg_base[mask]
-    return float(np.sum(fg * peak_mult * (1.0 - np.exp(-beta * d)) * np.exp(-gamma * d)))
-
-
-def solve_day(prepared_day, params):
-    p1, p3, beta_meal, gamma_meal, t_lag, peak_mult = params
-    obs_t = prepared_day["obs_t"]
-    obs_g = prepared_day["obs_g"]
-    meal_t = prepared_day["meal_t"]
-    fg_base = prepared_day["fg_base"]
-    t_span = np.arange(0, int(obs_t.max()) + 1, 5.0)
-
-    if prepared_day["extended"]:
-        def ode_func(y, t_val):
-            G, I, X, E = y
-            D = meal_disturbance(t_val, meal_t, fg_base, beta_meal, gamma_meal, t_lag, peak_mult)
-            hour_of_day = (t_val / 60.0) % 24.0
-            circadian = 1.0 + 0.15 * np.exp(-((hour_of_day - 6.0) ** 2) / 8.0) - 0.1 * np.exp(-((hour_of_day - 18.0) ** 2) / 16.0)
-            dEdt = np.clip((G - 15.0), -15.0, 15.0)
-            dGdt = (-p1 * G - X * (G + Gb) + D) * circadian
-            dIdt = -n * (I + Ib) + n * V1 * (Ib - P2 * p1 * 15.0 / p3 / (15.0 + Gb)) / V1
-            dXdt = -P2 * X + p3 * I
-            return [dGdt, dIdt, dXdt, dEdt]
-
-        y0 = [max(30.0, obs_g[0] - Gb), 0.0, 0.0, 0.0]
+############################################
+# 8. Main Function
+############################################
+def main(file_path, prediction_horizons=[15, 30, 45, 60], 
+         output_dir='results_baseline_bergman'):
+    """
+    BASELINE: Basic Bergman Minimal Model
+    - No GI effects
+    - No circadian rhythms
+    - No meal type differentiation
+    - Simple carbohydrate-based meal disturbance
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(os.path.join(output_dir, 'figures'), exist_ok=True)
+    
+    print("=" * 80)
+    print("BASELINE: BASIC BERGMAN MINIMAL MODEL (No GI, No Circadian)")
+    print("=" * 80)
+    
+    # Load data
+    print("\nLoading data...")
+    try:
+        data = load_and_preprocess(file_path)
+        data = preprocess_data(data)
+    except Exception as e:
+        print(f"Error: {e}")
+        return None, None
+    
+    unique_dates = sorted(data['Date'].unique())
+    print(f"Total measurements: {len(data)}")
+    print(f"Total days: {len(unique_dates)}")
+    print(f"Date range: {unique_dates[0]} to {unique_dates[-1]}")
+    
+    if len(unique_dates) < 3:
+        print("Error: Need at least 3 days")
+        return None, None
+    
+    # LODO splits
+    print("\nCreating LODO splits...")
+    lodo_splits = lodo_cv_split(data)
+    print(f"Number of LODO folds: {len(lodo_splits)}")
+    
+    # Parameter bounds (same 6 parameters)
+    pbounds = {
+        'p1': (0.005, 0.05),
+        'p3': (1e-6, 1e-4),
+        'beta_meal': (0.01, 0.5),
+        'gamma_meal': (0.01, 0.5),
+        't_lag': (10, 60),
+        'peak_mult': (2.0, 6.0)
+    }
+    
+    all_results = {PH: [] for PH in prediction_horizons}
+    
+    # LODO Loop
+    print("\n" + "=" * 80)
+    print("LODO Cross-Validation with Internal 5-Fold")
+    print("=" * 80)
+    
+    for lodo_idx, (train_dates, test_dates) in enumerate(lodo_splits):
+        test_date = test_dates[0]
+        
+        print(f"\n{'='*60}")
+        print(f"LODO Fold {lodo_idx + 1}/{len(lodo_splits)}")
+        print(f"Test date: {test_date}")
+        print(f"{'='*60}")
+        
+        train_data = data[data['Date'].isin(train_dates)].copy()
+        test_data = data[data['Date'].isin(test_dates)].copy()
+        
+        if len(train_data) < 10 or len(test_data) < 5:
+            print("Insufficient data, skipping")
+            continue
+        
+        # Internal 5-fold split
+        internal_folds = split_train_into_5folds(train_data)
+        
+        # Optimize on Internal Fold 1
+        print("  Optimizing parameters on Fold 1...")
+        if len(internal_folds[0]) < 10:
+            print("  Insufficient data, skipping")
+            continue
+        
+        best_params = optimize_parameters_basic(internal_folds[0], pbounds, 
+                                               init_points=3, n_iter=10)
+        
+        if best_params is None:
+            print("  Optimization failed, skipping")
+            continue
+        
+        print("  Optimized parameters:")
+        for key, val in best_params.items():
+            print(f"    {key:15s}: {val:.6f}")
+        
+        # Test on held-out day
+        print(f"  Testing on {test_date}...")
+        test_predictions = predict_last_step_basic(test_data, best_params, 
+                                                   prediction_horizons)
+        
+        for PH in prediction_horizons:
+            if test_predictions[PH]:
+                metrics = evaluate_predictions(test_predictions[PH])
+                
+                if metrics:
+                    print(f"    PH={PH}min: RMSE={metrics['RMSE']:.2f} mg/dL, "
+                          f"N={metrics['N_Predictions']}")
+                    
+                    all_results[PH].append({
+                        'lodo_fold': lodo_idx + 1,
+                        'test_date': test_date,
+                        **metrics,
+                        **best_params
+                    })
+    
+    # Aggregate results
+    print("\n" + "=" * 80)
+    print("FINAL RESULTS - BASELINE MODEL")
+    print("=" * 80)
+    
+    summary_results = []
+    
+    for PH in prediction_horizons:
+        if not all_results[PH]:
+            continue
+        
+        results_df = pd.DataFrame(all_results[PH])
+        
+        rmse_mean = results_df['RMSE'].mean()
+        rmse_std = results_df['RMSE'].std()
+        mae_mean = results_df['MAE'].mean()
+        mae_std = results_df['MAE'].std()
+        
+        print(f"\n{'='*60}")
+        print(f"PH: {PH} minutes")
+        print(f"{'='*60}")
+        print(f"RMSE: {rmse_mean:7.2f} ± {rmse_std:6.2f} mg/dL")
+        print(f"MAE:  {mae_mean:7.2f} ± {mae_std:6.2f} mg/dL")
+        print(f"N folds: {len(results_df)}")
+        
+        summary_results.append({
+            'PH': PH,
+            'RMSE_mean': rmse_mean,
+            'RMSE_std': rmse_std,
+            'MAE_mean': mae_mean,
+            'MAE_std': mae_std,
+            'MAPE_mean': results_df['MAPE'].mean(),
+            'MAPE_std': results_df['MAPE'].std(),
+            'Time_in_Range_mean': results_df['Time_in_Range'].mean(),
+            'Time_in_Range_std': results_df['Time_in_Range'].std(),
+            'N_folds': len(results_df)
+        })
+        
+        results_df.to_csv(
+            os.path.join(output_dir, f'baseline_detailed_PH{PH}.csv'),
+            index=False
+        )
+    
+    if summary_results:
+        summary_df = pd.DataFrame(summary_results)
+        summary_df.to_csv(os.path.join(output_dir, 'baseline_summary.csv'), 
+                         index=False)
+        
+        print("\n" + "=" * 80)
+        print("SUMMARY TABLE - BASELINE BERGMAN MODEL")
+        print("=" * 80)
+        print("\nPH (min) | RMSE (mg/dL)    | MAE (mg/dL)")
+        print("-" * 50)
+        for _, row in summary_df.iterrows():
+            print(f"{int(row['PH']):8d} | {row['RMSE_mean']:6.2f} ± {row['RMSE_std']:5.2f} | "
+                  f"{row['MAE_mean']:6.2f} ± {row['MAE_std']:5.2f}")
+        
+        print("\n" + "=" * 80)
+        print(f"Results saved to: {output_dir}")
+        print("=" * 80)
+        print("\nModel Features:")
+        print("  ✓ Basic Bergman Minimal Model (3 ODE equations)")
+        print("  ✗ No GI effects")
+        print("  ✗ No circadian rhythms")
+        print("  ✗ No meal type differentiation")
+        print("  ✓ Simple carbohydrate-based meal disturbance")
+        print("=" * 80)
+        
+        return summary_df, all_results
     else:
-        def ode_func(y, t_val):
-            G, I, X = y
-            D = meal_disturbance(t_val, meal_t, fg_base, beta_meal, gamma_meal, t_lag, peak_mult)
-            dGdt = -p1 * G - X * (G + Gb) + D
-            dIdt = -n * (I + Ib) + n * V1 * (Ib - P2 * p1 * 15.0 / p3 / (15.0 + Gb)) / V1
-            dXdt = -P2 * X + p3 * I
-            return [dGdt, dIdt, dXdt]
+        print("\nNo results generated!")
+        return None, None
 
-        y0 = [max(30.0, obs_g[0] - Gb), 0.0, 0.0]
-
-    sol = odeint(ode_func, y0, t_span)
-    pred = np.interp(obs_t, t_span, sol[:, 0] + Gb)
-    return pred
-
-
-def rmse(y_true, y_pred):
-    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
-
-
-def add_random_candidates(base_candidates, n_extra: int, extended: bool, seed: int = 42):
-    rng = np.random.default_rng(seed)
-    out = [list(x) for x in base_candidates]
-    for _ in range(n_extra):
-        if extended:
-            out.append([
-                rng.uniform(0.005, 0.05),
-                rng.uniform(1e-6, 1e-4),
-                rng.uniform(0.01, 0.5),
-                rng.uniform(0.01, 0.5),
-                rng.uniform(10, 60),
-                rng.uniform(2.0, 6.0),
-            ])
-        else:
-            out.append([
-                rng.uniform(0.005, 0.05),
-                rng.uniform(1e-6, 1e-4),
-                rng.uniform(0.01, 0.5),
-                rng.uniform(0.01, 0.5),
-                rng.uniform(10, 60),
-                rng.uniform(1.0, 4.0),
-            ])
-    return out
-
-
-def choose_params(calib_days, valid_days, candidates):
-    best_params = None
-    best_score = np.inf
-
-    for params in candidates:
-        calib_rmse = np.mean([rmse(day["obs_g"], solve_day(day, params)) for day in calib_days])
-        valid_rmse = np.mean([rmse(day["obs_g"], solve_day(day, params)) for day in valid_days])
-        score = 0.3 * calib_rmse + 0.7 * valid_rmse
-        if score < best_score:
-            best_score = score
-            best_params = params
-
-    return np.array(best_params, dtype=float)
-
-
-def evaluate_test_day(day_data, params, extended: bool, prediction_horizons, obs_step: int = 10):
-    prepared = prepare_day(day_data, extended=extended, obs_step=obs_step)
-    pred = solve_day(prepared, params)
-    obs_t = prepared["obs_t"]
-    obs_g = prepared["obs_g"]
-
-    out = {}
-    for ph in prediction_horizons:
-        y_true, y_pred = [], []
-        for t_val in obs_t:
-            target_t = t_val + ph
-            if target_t > obs_t.max():
-                continue
-            y_true.append(np.interp(target_t, obs_t, obs_g))
-            y_pred.append(np.interp(target_t, obs_t, pred))
-        out[ph] = rmse(y_true, y_pred)
-    return out
-
-
-def run_example(input_csv: str, output_dir: str, prediction_horizons, n_lodo_folds: int, n_extra_candidates: int):
-    df = load_data(input_csv)
-    all_dates = sorted(df["Date"].unique())[:n_lodo_folds]
-
-    baseline_candidates = add_random_candidates(BASELINE_CANDIDATES, n_extra_candidates, extended=False, seed=42)
-    extended_candidates = add_random_candidates(EXTENDED_CANDIDATES, n_extra_candidates, extended=True, seed=42)
-
-    baseline_rows = []
-    extended_rows = []
-
-    for test_date in all_dates:
-        train_data = df[df["Date"] != test_date].copy()
-        test_data = df[df["Date"] == test_date].copy()
-        folds = split_train_into_5folds(train_data)
-
-        calib_data = pd.concat([f for f in folds[:4] if len(f) > 0], ignore_index=True)
-        valid_data = folds[4].copy()
-
-        calib_days_baseline = [prepare_day(calib_data[calib_data["Date"] == d], extended=False, obs_step=20) for d in sorted(calib_data["Date"].unique())]
-        calib_days_extended = [prepare_day(calib_data[calib_data["Date"] == d], extended=True, obs_step=20) for d in sorted(calib_data["Date"].unique())]
-        valid_days_baseline = [prepare_day(valid_data[valid_data["Date"] == d], extended=False, obs_step=20) for d in sorted(valid_data["Date"].unique())]
-        valid_days_extended = [prepare_day(valid_data[valid_data["Date"] == d], extended=True, obs_step=20) for d in sorted(valid_data["Date"].unique())]
-
-        baseline_params = choose_params(calib_days_baseline, valid_days_baseline, baseline_candidates)
-        extended_params = choose_params(calib_days_extended, valid_days_extended, extended_candidates)
-
-        baseline_metrics = evaluate_test_day(test_data, baseline_params, extended=False, prediction_horizons=prediction_horizons, obs_step=10)
-        extended_metrics = evaluate_test_day(test_data, extended_params, extended=True, prediction_horizons=prediction_horizons, obs_step=10)
-
-        for ph in prediction_horizons:
-            baseline_rows.append({"Test Day": str(test_date), "PH": ph, "RMSE": baseline_metrics[ph]})
-            extended_rows.append({"Test Day": str(test_date), "PH": ph, "RMSE": extended_metrics[ph]})
-
-    baseline_df = pd.DataFrame(baseline_rows)
-    extended_df = pd.DataFrame(extended_rows)
-
-    baseline_summary = baseline_df.groupby("PH")["RMSE"].agg(["mean", "std", "count"]).reset_index()
-    baseline_summary.columns = ["PH", "RMSE_mean", "RMSE_std", "N"]
-    extended_summary = extended_df.groupby("PH")["RMSE"].agg(["mean", "std", "count"]).reset_index()
-    extended_summary.columns = ["PH", "RMSE_mean", "RMSE_std", "N"]
-
-    comparison = baseline_summary[["PH", "RMSE_mean"]].merge(
-        extended_summary[["PH", "RMSE_mean"]], on="PH", suffixes=("_baseline", "_extended")
-    )
-    comparison["Improvement"] = comparison["RMSE_mean_baseline"] - comparison["RMSE_mean_extended"]
-
-    out_dir = Path(output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    baseline_summary.to_csv(out_dir / "baseline_003_summary_paper_aligned.csv", index=False)
-    extended_summary.to_csv(out_dir / "extended_003_summary_paper_aligned.csv", index=False)
-    comparison.to_csv(out_dir / "comparison_003_summary_paper_aligned.csv", index=False)
-
-    print("Saved example outputs to:", out_dir)
-    print("\nBaseline summary:\n", baseline_summary.to_string(index=False))
-    print("\nExtended summary:\n", extended_summary.to_string(index=False))
-    print("\nComparison summary:\n", comparison.to_string(index=False))
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--input_csv", required=True)
-    parser.add_argument("--output_dir", default="example_outputs_paper_aligned")
-    parser.add_argument("--n_lodo_folds", type=int, default=3)
-    parser.add_argument("--n_extra_candidates", type=int, default=8)
-    parser.add_argument("--prediction_horizons", type=int, nargs="+", default=[15, 30, 45, 60])
-    return parser.parse_args()
-
-
+############################################
+# CLI
+############################################
 if __name__ == "__main__":
-    args = parse_args()
-    run_example(
-        input_csv=args.input_csv,
-        output_dir=args.output_dir,
+    import argparse
+    parser = argparse.ArgumentParser(description="Baseline Bergman Minimal Model runner")
+    parser.add_argument("--input_csv", required=True, help="Path to one subject CSV file")
+    parser.add_argument("--output_dir", default="results_baseline", help="Directory to save outputs")
+    parser.add_argument("--prediction_horizons", nargs="+", type=int, default=[15, 30, 45, 60], help="Prediction horizons in minutes")
+    args = parser.parse_args()
+    os.makedirs(args.output_dir, exist_ok=True)
+    summary_df, all_results = main(
+        file_path=args.input_csv,
         prediction_horizons=args.prediction_horizons,
-        n_lodo_folds=args.n_lodo_folds,
-        n_extra_candidates=args.n_extra_candidates,
+        output_dir=args.output_dir,
     )
