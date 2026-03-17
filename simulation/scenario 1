@@ -1,0 +1,180 @@
+import numpy as np
+from scipy.integrate import odeint
+import matplotlib.pyplot as plt
+
+
+def meal_kernel(t, t_meal, tau, beta, lam, peak):
+    """
+    Bi-exponential meal absorption kernel:
+        kappa(t - t_m - tau) = I(t >= t_m + tau) * peak *
+                               (1 - exp(-beta * dt)) * exp(-lam * dt)
+    """
+    dt = t - t_meal - tau
+    if dt < 0:
+        return 0.0
+    return peak * (1.0 - np.exp(-beta * dt)) * np.exp(-lam * dt)
+
+
+def gi_modifier(gi_value):
+    """
+    Simple monotonic GI modifier for simulation-only figure reproduction.
+    """
+    return gi_value / 100.0
+
+
+def total_meal_disturbance(t, meal_times, carb_amounts, gi_values, params):
+    disturbance = 0.0
+    for tm, carbs, gi in zip(meal_times, carb_amounts, gi_values):
+        fm = carbs * gi_modifier(gi)
+        disturbance += fm * meal_kernel(
+            t=t,
+            t_meal=tm,
+            tau=params["tau"],
+            beta=params["beta"],
+            lam=params["lam"],
+            peak=params["peak"],
+        )
+    return disturbance
+
+
+def insulin_input(t, meal_times, meal_doses, basal_rate, pulse_width=10.0):
+    """
+    Simple bounded insulin delivery profile using short rectangular pulses.
+    """
+    u = basal_rate
+    for tm, dose in zip(meal_times, meal_doses):
+        if tm <= t < tm + pulse_width:
+            u += dose
+    return u
+
+
+def bergman_extended(y, t, params, gi_values, meal_doses):
+    """
+    Simplified simulation model for figure reproduction.
+    State variables are expressed as deviations from basal levels.
+    """
+    G, X, I = y
+
+    d_meal = total_meal_disturbance(
+        t=t,
+        meal_times=params["meal_times"],
+        carb_amounts=params["carb_amounts"],
+        gi_values=gi_values,
+        params=params,
+    )
+
+    u_t = insulin_input(
+        t=t,
+        meal_times=params["meal_times"],
+        meal_doses=meal_doses,
+        basal_rate=params["u_basal"],
+        pulse_width=params["pulse_width"],
+    )
+
+    dGdt = -params["p1"] * G - (G + params["Gb"]) * X + d_meal
+    dXdt = -params["p2"] * X + params["p3"] * I
+    dIdt = -params["n"] * I + u_t
+
+    return [dGdt, dXdt, dIdt]
+
+
+def run_simulation(params, gi_values, meal_doses, t_end=1200):
+    t = np.arange(0, t_end + 1, 1)
+    y0 = [30.0, -0.001, -6.0]
+    sol = odeint(bergman_extended, y0, t, args=(params, gi_values, meal_doses))
+
+    glucose = sol[:, 0] + params["Gb"]
+    insulin = sol[:, 2] + params["Ib"]
+    return t, glucose, insulin
+
+
+def main():
+    params = {
+        "Gb": 81.0,
+        "Ib": 15.0,
+        "p1": 0.0287,
+        "p2": 0.0287,
+        "p3": 5.035e-5,
+        "n": 5 / 54,
+        "tau": 10.0,
+        "beta": 0.03,
+        "lam": 0.01,
+        "peak": 1.5,
+        "meal_times": [60, 360, 660],
+        "carb_amounts": [60, 60, 60],   # fixed carbohydrate quantity
+        "u_basal": 0.02,
+        "pulse_width": 10.0,
+    }
+
+    gi_scenarios = {
+        "Low GI": [45, 45, 45],
+        "Medium GI": [60, 60, 60],
+        "High GI": [80, 80, 80],
+    }
+
+    insulin_scenarios = {
+        "No Insulin": [0.0, 0.0, 0.0],
+        "Low Dose": [0.03, 0.04, 0.05],
+        "Moderate Dose": [0.06, 0.08, 0.10],
+        "High Dose": [0.10, 0.12, 0.15],
+    }
+
+    # Panel (a): no insulin, different GI
+    t, g_low_no, _ = run_simulation(params, gi_scenarios["Low GI"], insulin_scenarios["No Insulin"])
+    _, g_med_no, _ = run_simulation(params, gi_scenarios["Medium GI"], insulin_scenarios["No Insulin"])
+    _, g_high_no, _ = run_simulation(params, gi_scenarios["High GI"], insulin_scenarios["No Insulin"])
+
+    # Panel (b): insulin comparison under GI-specific dosing
+    _, _, i_low = run_simulation(params, gi_scenarios["Low GI"], insulin_scenarios["Low Dose"])
+    _, _, i_med = run_simulation(params, gi_scenarios["Medium GI"], insulin_scenarios["Moderate Dose"])
+    _, _, i_high = run_simulation(params, gi_scenarios["High GI"], insulin_scenarios["High Dose"])
+
+    # Panel (c): glucose comparison after GI-tailored insulin dosing
+    _, g_low, _ = run_simulation(params, gi_scenarios["Low GI"], insulin_scenarios["Low Dose"])
+    _, g_med, _ = run_simulation(params, gi_scenarios["Medium GI"], insulin_scenarios["Moderate Dose"])
+    _, g_high, _ = run_simulation(params, gi_scenarios["High GI"], insulin_scenarios["High Dose"])
+
+    fig = plt.figure(figsize=(18, 6))
+
+    # (a)
+    ax1 = plt.subplot(1, 3, 1)
+    ax1.plot(t, g_low_no, label="Low GI")
+    ax1.plot(t, g_med_no, label="Medium GI")
+    ax1.plot(t, g_high_no, label="High GI")
+    ax1.axhline(70, linestyle="--")
+    ax1.axhline(180, linestyle="--")
+    ax1.scatter(params["meal_times"], [200] * 3, label="Meal Times")
+    ax1.set_xlabel("Time (min)")
+    ax1.set_ylabel("Glucose (mg/dL)")
+    ax1.set_title("(a) Blood Glucose Concentration (No Insulin)")
+    ax1.legend()
+
+    # (b)
+    ax2 = plt.subplot(1, 3, 2)
+    ax2.plot(t, i_low, label="Low GI")
+    ax2.plot(t, i_med, label="Medium GI")
+    ax2.plot(t, i_high, label="High GI")
+    ax2.set_xlabel("Time (min)")
+    ax2.set_ylabel("Insulin (mU/L)")
+    ax2.set_title("(b) Insulin Concentration")
+    ax2.legend()
+
+    # (c)
+    ax3 = plt.subplot(1, 3, 3)
+    ax3.plot(t, g_low, label="Low GI")
+    ax3.plot(t, g_med, label="Medium GI")
+    ax3.plot(t, g_high, label="High GI")
+    ax3.axhline(70, linestyle="--")
+    ax3.axhline(180, linestyle="--")
+    ax3.scatter(params["meal_times"], [100] * 3, label="Meal Times")
+    ax3.set_xlabel("Time (min)")
+    ax3.set_ylabel("Glucose (mg/dL)")
+    ax3.set_title("(c) Blood Glucose Concentration")
+    ax3.legend()
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
