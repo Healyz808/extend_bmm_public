@@ -14,7 +14,7 @@ This release is intentionally limited to the core **Scenario 4** workflow:
 - Bayesian optimisation of six model parameters
 - RMSE-based summary outputs
 
-This package is **not** a full reproduction of every figure, table, or internal analysis used during manuscript development.
+This package is **not** a full reproduction of every figure, table, or internal analysis used during manuscript development. The demo files are intended to demonstrate that the proposed extended model outperforms the baseline model in predictive performance.
 
 ## Files
 
