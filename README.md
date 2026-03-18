@@ -1,8 +1,6 @@
 # Minimal Public Release for Scenario 4
 
-This package provides a **minimal public-release implementation** of the core personalised multi-horizon prediction experiment from the manuscript:
-
-**“Integrating glycemic index and meal dynamics into glucose prediction models for type 2 diabetes management”**.
+This package provides a **minimal public-release implementation** of the core personalised multi-horizon prediction experiment from the manuscript.
 
 ## Scope
 
