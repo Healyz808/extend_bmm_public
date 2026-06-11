@@ -9,19 +9,22 @@ This release is intentionally limited to the core **Scenario 4** workflow:
 - single-subject glucose prediction
 - leave-one-day-out cross-validation (LODOCV)
 - 15 / 30 / 45 / 60 minute prediction horizons
-- Bayesian optimisation of six model parameters
+- optimisation of model parameters
 - RMSE-based summary outputs
+- Table 4-style aggregation from precomputed subject results
 
-This package is **not** a full reproduction of every figure, table, or internal analysis used during manuscript development. The demo files are intended to demonstrate that the proposed extended model outperforms the baseline model in predictive performance.
+This package is **not** a full reproduction of every figure, table, or internal analysis used during manuscript development. The demo files are intended to provide a portable minimal reproduction of the Scenario 4 workflow and the manuscript-style Table 4 summary.
 
 ## Files
 
-- `scenario4_min_public.py` — main minimal reproducible demo script
+- `scenario4_min_public.py` — main minimal reproducible Scenario 4 script
+- `demo.py` — Table 4-style demo runner; can either re-run models or aggregate saved results from `data/`
+- `summarize_parameters.py` — extracts fold-specific fitted parameters from saved detail files
 - `run_all_subjects.py` — optional batch runner for multiple subject CSV files
 - `requirements.txt` — Python dependencies
-- `LICENSE` — license for public release
+- `data/` — optional precomputed subject-level or fold-level result files, if included in the release
 
-## Expected Input Format
+## Expected Input Format for Re-running Models
 
 Each subject CSV file must contain the following columns:
 
@@ -50,13 +53,48 @@ Please note that this public code expects **subject-level CSV files already form
 pip install -r requirements.txt
 ```
 
-## Quick Demo
+## Quick Synthetic Demo
 
 Run a small synthetic example:
 
 ```bash
 python scenario4_min_public.py --demo --output_dir demo_outputs
 ```
+
+## Reconstruct Table 4 from Saved Results
+
+If the repository includes precomputed subject results in `data/`, Table 4 can be regenerated without re-optimising the models:
+
+```bash
+python demo.py \
+  --precomputed_dir data \
+  --output_dir table4_from_data
+```
+
+This produces:
+
+- `table4_subject_level_results.csv`
+- `table4_summary.csv`
+- `table4_paper_ready.csv`
+
+If fold-level detail files are available, it also produces:
+
+- `table4_fold_level_results.csv`
+
+## Summarise Fold-Specific Parameters
+
+LODOCV re-estimates parameters within each held-out-day fold. Therefore, each subject has fold-specific optimal parameters rather than one unique parameter set. To extract these parameters from saved detail files:
+
+```bash
+python summarize_parameters.py \
+  --precomputed_dir data \
+  --output_dir table4_from_data
+```
+
+This produces:
+
+- `parameter_fold_level.csv`
+- `parameter_subject_summary.csv`
 
 ## Run on One Subject
 
@@ -69,25 +107,15 @@ python scenario4_min_public.py \
 ## Batch Run Across Multiple Subjects
 
 ```bash
-python run_all_subjects.py \
+python demo.py \
   --input_dir path/to/formatted_subject_csvs \
-  --output_dir batch_results
+  --pattern "*.csv" \
+  --output_dir table4_rerun_outputs
 ```
-
-## Outputs
-
-For a single subject, the script generates:
-
-- `scenario4_detailed_results.csv`
-- `scenario4_summary_results.csv`
-
-For the batch runner, the script generates:
-
-- `scenario4_all_subjects_detailed.csv`
-- `scenario4_all_subjects_summary.csv`
 
 ## Notes
 
 - This release focuses on **clarity, portability, and minimal reproducibility**.
-- It omits internal exploratory utilities, figure-specific scripts, and manuscript drafting code.
-- Numerical results may vary from the final manuscript tables if different preprocessing, subject formatting, or software versions are used.
+- Saved `data/` results are the recommended path for reproducing manuscript-style Table 4 values quickly.
+- Re-running optimisation may produce numerical differences if preprocessing, subject formatting, optimiser settings, or dependency versions differ from the original internal pipeline.
+- LODOCV parameters are fold-specific. Subject-level parameter summaries report the mean and variability across held-out-day folds.
